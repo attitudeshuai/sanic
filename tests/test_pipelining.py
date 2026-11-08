@@ -94,7 +94,7 @@ def test_bad_headers(app, port):
         _, response2 = client.get("/", headers=bad_headers)
 
     assert response1.status == 200
-    assert response2.status == 413
+    assert response2.status == 431
     assert (
         response1.headers["x-request-id"] != response2.headers["x-request-id"]
     )

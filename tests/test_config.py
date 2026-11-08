@@ -16,6 +16,7 @@ from sanic import Sanic
 from sanic.config import DEFAULT_CONFIG, Config, DetailedConverter
 from sanic.constants import LocalCertCreator
 from sanic.exceptions import PyFileError
+from sanic.http import Http
 
 from .conftest import get_port
 
@@ -502,3 +503,59 @@ def test_convert_local_cert_creator(passed, expected):
     app = Sanic("Test")
     assert app.config.LOCAL_CERT_CREATOR is expected
     del os.environ["SANIC_LOCAL_CERT_CREATOR"]
+
+
+def test_header_quota_defaults():
+    config = Config()
+
+    assert config.REQUEST_MAX_HEADER_SIZE == 8192
+    # The new quotas default to permissive values so that any request
+    # accepted by the total size limit is still accepted.
+    assert config.REQUEST_MAX_HEADER_FIELD_SIZE >= Http.HEADER_CEILING
+    assert config.REQUEST_MAX_HEADER_FIELD_COUNT >= 1
+    assert Http.HEADER_MAX_FIELD_SIZE == config.REQUEST_MAX_HEADER_FIELD_SIZE
+    assert (
+        Http.HEADER_MAX_FIELD_COUNT
+        == config.REQUEST_MAX_HEADER_FIELD_COUNT
+    )
+
+
+@pytest.mark.parametrize(
+    "key",
+    (
+        "REQUEST_MAX_HEADER_SIZE",
+        "REQUEST_MAX_HEADER_FIELD_SIZE",
+        "REQUEST_MAX_HEADER_FIELD_COUNT",
+    ),
+)
+@pytest.mark.parametrize("invalid", (0, -1, "bad", True, 1.5))
+def test_invalid_header_quota_rejected(app: Sanic, key, invalid):
+    with pytest.raises(ValueError, match=key):
+        setattr(app.config, key, invalid)
+
+
+def test_lowered_header_quotas_propagate(app: Sanic):
+    app.config.REQUEST_MAX_HEADER_SIZE = 4096
+    app.config.REQUEST_MAX_HEADER_FIELD_SIZE = 128
+    app.config.REQUEST_MAX_HEADER_FIELD_COUNT = 16
+
+    assert Http.HEADER_MAX_SIZE == 4096
+    assert Http.HEADER_MAX_FIELD_SIZE == 128
+    assert Http.HEADER_MAX_FIELD_COUNT == 16
+
+
+def test_legacy_header_config_without_new_items():
+    config = Config(defaults={"REQUEST_MAX_HEADER_SIZE": 2048})
+
+    assert config.REQUEST_MAX_HEADER_SIZE == 2048
+    assert isinstance(config.REQUEST_MAX_HEADER_FIELD_SIZE, int)
+    assert isinstance(config.REQUEST_MAX_HEADER_FIELD_COUNT, int)
+
+
+def test_invalid_header_quota_from_env_fails_at_startup(monkeypatch):
+    monkeypatch.setenv(
+        "SANIC_REQUEST_MAX_HEADER_FIELD_COUNT", "not-a-number"
+    )
+
+    with pytest.raises(ValueError, match="REQUEST_MAX_HEADER_FIELD_COUNT"):
+        Config()

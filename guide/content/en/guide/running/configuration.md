@@ -287,6 +287,8 @@ If a value cannot be cast, it will default to a `str`.
 | REQUEST_BUFFER_SIZE       | 65536            | Request buffer size before request is paused, default is 64 Kib                                                                       |
 | REQUEST_ID_HEADER         | X-Request-ID     | The name of "X-Request-ID" HTTP header that contains request/correlation ID                                                           |
 | REQUEST_MAX_SIZE          | 100000000        | How big a request may be (bytes), default is 100 megabytes                                                                            |
+| REQUEST_MAX_HEADER_FIELD_COUNT | 8192       | Maximum number of header fields accepted on a request                                                                                 |
+| REQUEST_MAX_HEADER_FIELD_SIZE  | 16384      | Maximum size of a single header field line (bytes, excluding its CRLF)                                                                |
 | REQUEST_MAX_HEADER_SIZE   | 8192            | How big a request header may be (bytes), default is 8192 bytes                                                                         |
 | REQUEST_TIMEOUT           | 60               | How long a request can take to arrive (sec)                                                                                           |
 | RESPONSE_TIMEOUT          | 60               | How long a response can take to process (sec)                                                                                         |

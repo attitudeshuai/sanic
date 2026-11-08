@@ -60,6 +60,8 @@ DEFAULT_CONFIG = {
     "REAL_IP_HEADER": None,
     "REQUEST_BUFFER_SIZE": 65536,
     "REQUEST_MAX_HEADER_SIZE": 8192,  # Cannot exceed 16384
+    "REQUEST_MAX_HEADER_FIELD_SIZE": Http.HEADER_CEILING,
+    "REQUEST_MAX_HEADER_FIELD_COUNT": Http.HEADER_CEILING // 2,
     "REQUEST_ID_HEADER": "X-Request-ID",
     "REQUEST_MAX_SIZE": 100_000_000,
     "REQUEST_TIMEOUT": 60,
@@ -165,6 +167,8 @@ class Config(dict, metaclass=DescriptorMeta):
     REAL_IP_HEADER: str | None
     REQUEST_BUFFER_SIZE: int
     REQUEST_MAX_HEADER_SIZE: int
+    REQUEST_MAX_HEADER_FIELD_SIZE: int
+    REQUEST_MAX_HEADER_FIELD_COUNT: int
     REQUEST_ID_HEADER: str
     REQUEST_MAX_SIZE: int
     REQUEST_TIMEOUT: int
@@ -272,6 +276,8 @@ class Config(dict, metaclass=DescriptorMeta):
         if self.get("_init"):
             if attr in (
                 "REQUEST_MAX_HEADER_SIZE",
+                "REQUEST_MAX_HEADER_FIELD_SIZE",
+                "REQUEST_MAX_HEADER_FIELD_COUNT",
                 "REQUEST_BUFFER_SIZE",
                 "REQUEST_MAX_SIZE",
             ):
@@ -306,11 +312,32 @@ class Config(dict, metaclass=DescriptorMeta):
         self._FALLBACK_ERROR_FORMAT = value
 
     def _configure_header_size(self):
-        Http.set_header_max_size(
-            self.REQUEST_MAX_HEADER_SIZE,
-            self.REQUEST_BUFFER_SIZE - 4096,
-            self.REQUEST_MAX_SIZE,
+        header_quotas = {
+            "REQUEST_MAX_HEADER_SIZE": self.REQUEST_MAX_HEADER_SIZE,
+            "REQUEST_MAX_HEADER_FIELD_SIZE": (
+                self.REQUEST_MAX_HEADER_FIELD_SIZE
+            ),
+            "REQUEST_MAX_HEADER_FIELD_COUNT": (
+                self.REQUEST_MAX_HEADER_FIELD_COUNT
+            ),
+        }
+        for name, value in header_quotas.items():
+            self._validate_header_quota(name, value)
+
+        Http.set_header_limits(
+            max_size=self.REQUEST_MAX_HEADER_SIZE,
+            max_field_size=self.REQUEST_MAX_HEADER_FIELD_SIZE,
+            max_field_count=self.REQUEST_MAX_HEADER_FIELD_COUNT,
+            buffer_size=self.REQUEST_BUFFER_SIZE,
+            request_max_size=self.REQUEST_MAX_SIZE,
         )
+
+    @staticmethod
+    def _validate_header_quota(name: str, value: Any) -> None:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(
+                f"Invalid {name}: must be a positive integer, got {value!r}."
+            )
 
     def _configure_warnings(self):
         filterwarnings(

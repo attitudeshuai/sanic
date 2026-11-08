@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 
 
 if TYPE_CHECKING:
@@ -14,6 +14,7 @@ from sanic.compat import Header
 from sanic.exceptions import (
     BadRequest,
     ExpectationFailed,
+    HeaderFieldsTooLarge,
     PayloadTooLarge,
     RequestCancelled,
     ServerError,
@@ -34,9 +35,10 @@ class Http(Stream, metaclass=TouchUpMeta):
     """ "Internal helper for managing the HTTP/1.1 request/response cycle.
 
     Raises:
-        BadRequest: If the request body is malformed.
+        BadRequest: If the request body or headers are malformed.
         Exception: If the request is malformed.
         ExpectationFailed: If the request is malformed.
+        HeaderFieldsTooLarge: If the request headers exceed a quota.
         PayloadTooLarge: If the request body exceeds the size limit.
         RuntimeError: If the response status is invalid.
         ServerError: If the handler does not produce a response.
@@ -45,6 +47,8 @@ class Http(Stream, metaclass=TouchUpMeta):
 
     HEADER_CEILING = 16_384
     HEADER_MAX_SIZE = 0
+    HEADER_MAX_FIELD_SIZE = HEADER_CEILING
+    HEADER_MAX_FIELD_COUNT = HEADER_CEILING // 2
     __touchup__ = (
         "http1_request_header",
         "http1_response_header",
@@ -180,11 +184,23 @@ class Http(Stream, metaclass=TouchUpMeta):
         # Receive until full header is in buffer
         buf = self.recv_buffer
         pos = 0
+        bytes_scanned = 0
+        lines_scanned = 0
+        field_count = 0
 
         while True:
             pos = buf.find(b"\r\n\r\n", pos)
             if pos != -1:
                 break
+
+            # Reject illegal bytes and bare CR/LF as soon as they arrive,
+            # then enforce the per-field and field-count quotas on
+            # complete lines, so reading stops before the terminating
+            # blank line arrives whenever a rule is violated.
+            bytes_scanned = self._scan_header_bytes(buf, bytes_scanned)
+            lines_scanned, field_count = self._scan_header_quotas(
+                buf, lines_scanned, field_count
+            )
 
             pos = max(0, len(buf) - 3)
             if pos >= self.HEADER_MAX_SIZE:
@@ -193,11 +209,15 @@ class Http(Stream, metaclass=TouchUpMeta):
             await self._receive_more()
 
         if pos >= self.HEADER_MAX_SIZE:
-            raise PayloadTooLarge("Request header exceeds the size limit")
+            self._reject_header_too_large()
+
+        # Framing, illegal byte and header quota validation. This only
+        # adds rejection paths; accepted requests are parsed unchanged.
+        head = buf[:pos]
+        self._validate_request_head(head)
 
         # Parse header content
         try:
-            head = buf[:pos]
             raw_headers = head.decode(errors="surrogateescape")
             reqline, *split_headers = raw_headers.split("\r\n")
             method, self.url, protocol = reqline.split(" ")
@@ -233,7 +253,7 @@ class Http(Stream, metaclass=TouchUpMeta):
 
                 headers.append(h)
         except Exception:
-            raise BadRequest("Bad Request")
+            self._reject_bad_header()
 
         if not self.protocol.app.config.KEEP_ALIVE:
             self.keep_alive = False
@@ -293,6 +313,112 @@ class Http(Stream, metaclass=TouchUpMeta):
         del buf[: pos + 4]
         self.request, request.stream = request, self
         self.protocol.state["requests_count"] += 1
+
+    def _scan_header_bytes(
+        self, buf: bytearray, scanned: int
+    ) -> int:
+        """Reject illegal bytes and bare CR/LF on buffered header data.
+
+        Every byte up to the pending final byte is validated once. The
+        final byte is left for the next pass because a trailing CR may
+        be the first half of a CRLF whose LF has not arrived yet.
+        """
+        end = len(buf) - 1
+        index = scanned
+        while index < end:
+            byte = buf[index]
+            if byte == 0x0A:
+                # An LF must be the second half of a CRLF token.
+                if index == 0 or buf[index - 1] != 0x0D:
+                    self._reject_bad_header()
+            elif byte == 0x0D:
+                # A CR must be followed by an LF.
+                if buf[index + 1] != 0x0A:
+                    self._reject_bad_header()
+            elif (byte < 0x20 and byte != 0x09) or byte == 0x7F:
+                self._reject_bad_header()
+            index += 1
+        return max(scanned, end)
+
+    def _scan_header_quotas(
+        self, buf: bytearray, scanned: int, field_count: int
+    ) -> tuple[int, int]:
+        """Check completed header lines against per-field quotas.
+
+        Only lines terminated by CRLF in the currently buffered data are
+        inspected, so a partially received line is rechecked once it is
+        complete. Reading is stopped immediately when a quota is exceeded,
+        before the terminating blank line arrives.
+        """
+        last_eol = buf.rfind(b"\r\n")
+        if last_eol <= scanned:
+            return scanned, field_count
+
+        lines = bytes(buf[scanned:last_eol]).split(b"\r\n")
+        if scanned == 0:
+            # The first line is the request line, not a header field.
+            lines = lines[1:]
+
+        for line in lines:
+            if line[:1] in (b" ", b"\t"):
+                # Obsolete line folding (a continuation line) is invalid.
+                self._reject_bad_header()
+            field_count += 1
+            if field_count > self.HEADER_MAX_FIELD_COUNT:
+                self._reject_header_too_large()
+            if len(line) > self.HEADER_MAX_FIELD_SIZE:
+                self._reject_header_too_large()
+
+        return last_eol + 2, field_count
+
+    def _validate_request_head(self, head: bytes) -> None:
+        """Validate framing, byte content and quotas of a header block.
+
+        This only adds rejection paths. Requests that pass validation go
+        through the existing parsing logic with identical value, casing
+        and multi-value semantics.
+        """
+        lines = head.split(b"\r\n")
+        field_lines = lines[1:]
+
+        if len(field_lines) > self.HEADER_MAX_FIELD_COUNT:
+            self._reject_header_too_large()
+
+        for line in lines:
+            # After splitting on the CRLF token any remaining CR/LF is a
+            # bare carriage return or line feed.
+            if b"\r" in line or b"\n" in line:
+                self._reject_bad_header()
+            # Obsolete line folding: a continuation line starting with
+            # SP/HT is not accepted.
+            if line[:1] in (b" ", b"\t"):
+                self._reject_bad_header()
+            # Horizontal tab is the only allowed control character.
+            # NUL, other controls and DEL are illegal bytes.
+            for byte in line:
+                if (byte < 0x20 and byte != 0x09) or byte == 0x7F:
+                    self._reject_bad_header()
+
+        for line in field_lines:
+            if len(line) > self.HEADER_MAX_FIELD_SIZE:
+                self._reject_header_too_large()
+
+    def _reject_header_too_large(self) -> NoReturn:
+        """Reject an over-quota header block and seal the connection."""
+        self.keep_alive = False
+        self.recv_buffer.clear()
+        raise HeaderFieldsTooLarge("Request header exceeds the size limit")
+
+    def _reject_bad_header(self) -> NoReturn:
+        """Reject a malformed header block and seal the connection.
+
+        Buffered bytes, including any pipelined request following the
+        malformed header, are dropped so they can never be parsed as a
+        new request on this connection.
+        """
+        self.keep_alive = False
+        self.recv_buffer.clear()
+        raise BadRequest("Bad Request")
 
     async def http1_response_header(
         self, data: bytes, end_stream: bool
@@ -626,6 +752,26 @@ class Http(Stream, metaclass=TouchUpMeta):
             *sizes,
             cls.HEADER_CEILING,
         )
+
+    @classmethod
+    def set_header_limits(
+        cls,
+        *,
+        max_size: int,
+        max_field_size: int,
+        max_field_count: int,
+        buffer_size: int | None = None,
+        request_max_size: int | None = None,
+    ) -> None:
+        """Configure all request header parsing quotas."""
+        sizes = [max_size, cls.HEADER_CEILING]
+        if buffer_size is not None:
+            sizes.append(buffer_size - 4096)
+        if request_max_size is not None:
+            sizes.append(request_max_size)
+        cls.HEADER_MAX_SIZE = min(*sizes)
+        cls.HEADER_MAX_FIELD_SIZE = max_field_size
+        cls.HEADER_MAX_FIELD_COUNT = max_field_count
 
     @staticmethod
     def _safe_int(value: str, base: int = 10) -> int:

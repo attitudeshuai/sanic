@@ -3,7 +3,11 @@ from unittest.mock import Mock
 import pytest
 
 from sanic import Sanic, headers, json, text
-from sanic.exceptions import InvalidHeader, PayloadTooLarge
+from sanic.exceptions import (
+    BadRequest,
+    HeaderFieldsTooLarge,
+    InvalidHeader,
+)
 from sanic.http import Http
 from sanic.request import Request
 
@@ -17,6 +21,45 @@ def raised_ceiling():
     Http.HEADER_CEILING = 32_768
     yield
     Http.HEADER_CEILING = 16_384
+
+
+@pytest.fixture
+def header_limits():
+    snapshot = (
+        Http.HEADER_MAX_SIZE,
+        Http.HEADER_MAX_FIELD_SIZE,
+        Http.HEADER_MAX_FIELD_COUNT,
+    )
+    yield
+    (
+        Http.HEADER_MAX_SIZE,
+        Http.HEADER_MAX_FIELD_SIZE,
+        Http.HEADER_MAX_FIELD_COUNT,
+    ) = snapshot
+
+
+def make_http(
+    recv_buffer,
+    *,
+    max_size=8192,
+    max_field_size=16384,
+    max_field_count=8192,
+):
+    async def _receive_more():
+        recv_buffer.extend(b"123")
+
+    protocol = Mock()
+    http = Http(protocol)
+    http._receive_more = _receive_more
+    http.recv_buffer = recv_buffer
+    Http.set_header_limits(
+        max_size=max_size,
+        max_field_size=max_field_size,
+        max_field_count=max_field_count,
+        buffer_size=65536,
+        request_max_size=100_000_000,
+    )
+    return http
 
 
 @pytest.mark.parametrize(
@@ -70,81 +113,144 @@ def test_parse_headers(input, expected):
 
 
 @pytest.mark.asyncio
-async def test_header_size_exceeded():
+async def test_header_size_exceeded(header_limits):
     recv_buffer = bytearray()
-
-    async def _receive_more():
-        nonlocal recv_buffer
-        recv_buffer += b"123"
-
-    protocol = Mock()
     Http.set_header_max_size(1)
-    http = Http(protocol)
-    http._receive_more = _receive_more
-    http.recv_buffer = recv_buffer
+    http = make_http(recv_buffer)
 
-    with pytest.raises(PayloadTooLarge):
+    with pytest.raises(HeaderFieldsTooLarge):
         await http.http1_request_header()
+
+    assert http.keep_alive is False
+    assert len(recv_buffer) == 0
 
 
 @pytest.mark.asyncio
-async def test_header_size_increased_okay():
+async def test_header_size_increased_okay(header_limits):
     recv_buffer = bytearray()
-
-    async def _receive_more():
-        nonlocal recv_buffer
-        recv_buffer += b"123"
-
-    protocol = Mock()
     Http.set_header_max_size(12_288)
-    http = Http(protocol)
-    http._receive_more = _receive_more
-    http.recv_buffer = recv_buffer
+    http = make_http(recv_buffer)
 
-    with pytest.raises(PayloadTooLarge):
+    with pytest.raises(HeaderFieldsTooLarge):
         await http.http1_request_header()
 
-    assert len(recv_buffer) == 12_291
+    assert http.keep_alive is False
+    assert len(recv_buffer) == 0
 
 
 @pytest.mark.asyncio
-async def test_header_size_exceeded_maxed_out():
+async def test_header_size_exceeded_maxed_out(header_limits):
     recv_buffer = bytearray()
-
-    async def _receive_more():
-        nonlocal recv_buffer
-        recv_buffer += b"123"
-
-    protocol = Mock()
     Http.set_header_max_size(18_432)
-    http = Http(protocol)
-    http._receive_more = _receive_more
-    http.recv_buffer = recv_buffer
+    http = make_http(recv_buffer)
 
-    with pytest.raises(PayloadTooLarge):
+    with pytest.raises(HeaderFieldsTooLarge):
         await http.http1_request_header()
 
-    assert len(recv_buffer) == 16_389
+    assert http.keep_alive is False
+    assert len(recv_buffer) == 0
 
 
 @pytest.mark.asyncio
-async def test_header_size_exceeded_raised_ceiling(raised_ceiling):
+async def test_header_size_exceeded_raised_ceiling(
+    raised_ceiling, header_limits
+):
     recv_buffer = bytearray()
-
-    async def _receive_more():
-        nonlocal recv_buffer
-        recv_buffer += b"123"
-
-    protocol = Mock()
-    http = Http(protocol)
     Http.set_header_max_size(65_536)
-    http._receive_more = _receive_more
-    http.recv_buffer = recv_buffer
+    http = make_http(recv_buffer)
 
-    with pytest.raises(PayloadTooLarge):
+    with pytest.raises(HeaderFieldsTooLarge):
         await http.http1_request_header()
 
-    assert len(recv_buffer) == 32_772
+    assert http.keep_alive is False
+    assert len(recv_buffer) == 0
+
+
+@pytest.mark.asyncio
+async def test_header_field_size_exceeded(header_limits):
+    recv_buffer = bytearray(
+        b"GET / HTTP/1.1\r\n"
+        b"X-Long: " + b"a" * 100 + b"\r\n"
+        b"\r\n"
+    )
+    http = make_http(recv_buffer, max_field_size=50)
+
+    with pytest.raises(HeaderFieldsTooLarge):
+        await http.http1_request_header()
+
+    assert http.keep_alive is False
+    assert len(recv_buffer) == 0
+
+
+@pytest.mark.asyncio
+async def test_header_field_size_exceeded_before_terminator(header_limits):
+    # The long line is complete (CRLF terminated) but the blank line that
+    # ends the header block has not arrived yet.
+    recv_buffer = bytearray(
+        b"GET / HTTP/1.1\r\nX-Long: " + b"a" * 100 + b"\r\n"
+    )
+    http = make_http(recv_buffer, max_field_size=50)
+
+    with pytest.raises(HeaderFieldsTooLarge):
+        await http.http1_request_header()
+
+    assert http.keep_alive is False
+    assert len(recv_buffer) == 0
+
+
+@pytest.mark.asyncio
+async def test_header_field_count_exceeded(header_limits):
+    recv_buffer = bytearray(
+        b"GET / HTTP/1.1\r\n"
+        + b"".join(f"X-{index}: v\r\n".encode() for index in range(5))
+        + b"\r\n"
+    )
+    http = make_http(recv_buffer, max_field_count=3)
+
+    with pytest.raises(HeaderFieldsTooLarge):
+        await http.http1_request_header()
+
+    assert http.keep_alive is False
+    assert len(recv_buffer) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b"GET / HTTP/1.1\r\nX-Bad: ab\x00cd\r\n\r\n",
+        b"GET / HTTP/1.1\r\nX-Bad: ab\x7fcd\r\n\r\n",
+        b"GET / HTTP/1.1\r\nX-Bad: ab\x01cd\r\n\r\n",
+        b"GET / HTTP/1.1\nX-Bad: value\n\n",
+        b"GET / HTTP/1.1\r\nX-Bad: ab\rcd\r\n\r\n",
+        b"GET / HTTP/1.1\r\nX-Bad: value\r\n folded\r\n\r\n",
+        b"GET / HTTP/1.1\r\nX-Bad: value\r\n\tfolded\r\n\r\n",
+    ),
+)
+async def test_malformed_request_head_rejected(payload, header_limits):
+    recv_buffer = bytearray(payload)
+    http = make_http(recv_buffer)
+
+    with pytest.raises(BadRequest):
+        await http.http1_request_header()
+
+    assert http.keep_alive is False
+    assert len(recv_buffer) == 0
+
+
+@pytest.mark.asyncio
+async def test_malformed_head_drops_pipelined_request(header_limits):
+    pipelined = b"GET /next HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    recv_buffer = bytearray(
+        b"GET / HTTP/1.1\r\nX-Bad: ab\x00cd\r\n\r\n" + pipelined
+    )
+    http = make_http(recv_buffer)
+
+    with pytest.raises(BadRequest):
+        await http.http1_request_header()
+
+    # Residual bytes must not survive to be parsed as a new request.
+    assert len(recv_buffer) == 0
 
 
 def test_raw_headers(app):
