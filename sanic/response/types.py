@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Coroutine, Iterator
+from collections.abc import Coroutine, Iterable, Iterator
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, AnyStr, Callable, TypeVar
 
@@ -8,8 +8,15 @@ from sanic.compat import Header
 from sanic.cookies import CookieJar
 from sanic.cookies.response import Cookie, SameSite
 from sanic.exceptions import SanicException, ServerError
-from sanic.helpers import Default, _default, has_message_body, json_dumps
+from sanic.helpers import (
+    Default,
+    _default,
+    has_message_body,
+    is_protected_trailer_header,
+    json_dumps,
+)
 from sanic.http import Http
+from sanic.http.constants import Stage
 
 
 if TYPE_CHECKING:
@@ -34,6 +41,8 @@ class BaseHTTPResponse:
         "status",
         "headers",
         "_cookies",
+        "_trailer_names",
+        "trailers",
     )
 
     _dumps = json_dumps
@@ -46,6 +55,8 @@ class BaseHTTPResponse:
         self.status: int = None
         self.headers = Header({})
         self._cookies: CookieJar | None = None
+        self._trailer_names: tuple[str, ...] | None = None
+        self.trailers: Header | None = None
 
     def __repr__(self):
         class_name = self.__class__.__name__
@@ -120,6 +131,161 @@ class BaseHTTPResponse:
             data,  # type: ignore
             end_stream=end_stream or False,
         )
+
+    def declare_trailers(self, *names: str | Iterable[str]) -> None:
+        """Declare the trailer fields that may follow the response body.
+
+        The names must be declared before any body byte is written. When
+        the response is eventually finished, the values stored on
+        :attr:`trailers` are encoded as the chunked trailer section,
+        before the end-of-chunk marker. A ``Trailer`` header announcing
+        the names is added to the response headers.
+
+        Trailers are only available on chunked HTTP/1.1 responses.
+        Protected names that control framing, routing, caching, payload
+        processing or authentication are rejected here, deterministically,
+        instead of being silently dropped on the wire.
+
+        Args:
+            *names: Trailer field names, either as individual arguments or
+                as a single iterable of names.
+
+        Raises:
+            ServerError: If a name is protected or invalid, trailers are not
+                usable for this response, or the body has already started.
+        """  # noqa: E501
+        normalized = self._normalize_trailer_names(names)
+
+        # Declaration must happen before any body byte is written; it can
+        # never be interleaved with body writes.
+        stream = self.stream
+        if (
+            stream is not None
+            and getattr(stream, "stage", None) is Stage.RESPONSE
+        ):
+            raise ServerError(
+                "Cannot declare trailers after the response body has started."
+            )
+
+        # A repeated declaration is accepted only when it carries the exact
+        # same set of names. Any change of an existing declaration fails
+        # deterministically instead of being silently replaced.
+        if self._trailer_names is not None:
+            if {name.lower() for name in normalized} == {
+                name.lower() for name in self._trailer_names
+            }:
+                return
+            raise ServerError(
+                "Trailer fields have already been declared with a "
+                "different set of names."
+            )
+
+        if not has_message_body(self.status):
+            raise ServerError(
+                f"Trailers are not allowed on a {self.status} response "
+                "without a message body."
+            )
+
+        if "content-length" in self.headers:
+            raise ServerError(
+                "Trailers can only be used with chunked transfer encoding, "
+                "not with a Content-Length response."
+            )
+
+        if stream is not None:
+            app = getattr(getattr(stream, "protocol", None), "app", None)
+            if app is not None and not app.config.TRAILERS_ENABLED:
+                raise ServerError("Response trailers have been disabled.")
+            if not isinstance(stream, Http):
+                raise ServerError(
+                    "Trailers are only supported for chunked HTTP/1.1 "
+                    "responses."
+                )
+
+        self._trailer_names = tuple(normalized)
+        self.trailers = Header()
+        # Announce the trailer field names ahead of the body, as required
+        # by the chunked transfer coding.
+        self.headers["trailer"] = ", ".join(normalized)
+
+    @staticmethod
+    def _normalize_trailer_names(
+        names: tuple[str | Iterable[str], ...],
+    ) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in names:
+            candidates: Iterable[str]
+            if isinstance(item, str):
+                candidates = (item,)
+            else:
+                candidates = item
+            for name in candidates:
+                if not isinstance(name, str) or not name:
+                    raise ServerError(
+                        "Trailer field names must be non-empty strings."
+                    )
+                if any(char in name for char in " \t\r\n\0:"):
+                    raise ServerError(f"Invalid trailer field name: {name!r}.")
+                lowered = name.lower()
+                if is_protected_trailer_header(lowered):
+                    raise ServerError(
+                        f"'{name}' is a protected field and cannot be sent "
+                        "as a trailer."
+                    )
+                if lowered in seen:
+                    continue
+                seen.add(lowered)
+                normalized.append(name)
+        if not normalized:
+            raise ServerError(
+                "At least one trailer field name must be declared."
+            )
+        return normalized
+
+    def get_trailer_section(self) -> bytes:
+        """Encode the declared trailer fields for the chunked wire format.
+
+        Returns an empty bytes object when no trailers were declared, in
+        which case the chunked terminator stays byte-identical to a
+        response without trailers.
+
+        Raises:
+            ServerError: If a declared field has no value or an undeclared
+                field was assigned.
+        """
+        if self.trailers is None or self._trailer_names is None:
+            return b""
+
+        trailer_names = self._trailer_names
+        declared = [name.lower() for name in trailer_names]
+        provided = {name.lower() for name in self.trailers.keys()}
+        missing = [name for name in declared if name not in provided]
+        if missing:
+            raise ServerError(
+                "Declared trailer field(s) without a value: "
+                + ", ".join(missing)
+            )
+        undeclared = [name for name in provided if name not in declared]
+        if undeclared:
+            raise ServerError(
+                "Undeclared trailer field(s) cannot be sent: "
+                + ", ".join(undeclared)
+            )
+
+        lines = []
+        for name in trailer_names:
+            value = self.trailers.getone(name)
+            lines.append(
+                b"%b: %b\r\n"
+                % (
+                    self._sanitize_header_value(name).encode("ascii"),
+                    self._sanitize_header_value(f"{value}").encode(
+                        errors="surrogateescape"
+                    ),
+                )
+            )
+        return b"".join(lines)
 
     def add_cookie(
         self,

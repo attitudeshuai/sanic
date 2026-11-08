@@ -112,6 +112,63 @@ _HOP_BY_HOP_HEADERS = frozenset(
     ]
 )
 
+# Field names that are forbidden as chunked response trailer fields. A
+# trailer is only emitted after the body has started, so anything that
+# controls message framing, routing, payload processing, caching or
+# authentication cannot be moved there without changing how the message
+# must be parsed or cached. See RFC 9112 section 6.3.2 (formerly RFC 7230
+# section 4.1.2).
+_PROTECTED_TRAILER_HEADERS = frozenset(
+    [
+        # message framing / hop-by-hop
+        "connection",
+        "content-length",
+        "keep-alive",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        # routing
+        "host",
+        # payload processing / entity headers
+        "content-encoding",
+        "content-language",
+        "content-location",
+        "content-md5",
+        "content-range",
+        "content-type",
+        # response control data / caching
+        "age",
+        "cache-control",
+        "date",
+        "etag",
+        "expires",
+        "last-modified",
+        "location",
+        "pragma",
+        "retry-after",
+        "server",
+        "vary",
+        "warning",
+        # authentication
+        "authorization",
+        "cookie",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "set-cookie",
+        "www-authenticate",
+        # request modifiers / conditionals
+        "expect",
+        "if-match",
+        "if-modified-since",
+        "if-none-match",
+        "if-range",
+        "if-unmodified-since",
+        "max-forwards",
+        "range",
+    ]
+)
+
 
 def has_message_body(status):
     """
@@ -131,6 +188,16 @@ def is_entity_header(header):
 def is_hop_by_hop_header(header):
     """Checks if the given header is a Hop By Hop header"""
     return header.lower() in _HOP_BY_HOP_HEADERS
+
+
+def is_protected_trailer_header(header):
+    """Checks if the given header is forbidden as a trailer field.
+
+    Trailer fields are sent after the message body. Names that affect
+    framing, routing, payload processing, caching or authentication must
+    therefore be rejected at declaration time.
+    """
+    return header.lower() in _PROTECTED_TRAILER_HEADERS
 
 
 def import_string(module_name, package=None):

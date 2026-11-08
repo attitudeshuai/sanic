@@ -312,6 +312,9 @@ class Http(Stream, metaclass=TouchUpMeta):
         if not isinstance(status, int) or status < 200:
             raise RuntimeError(f"Invalid response status {status!r}")
 
+        if res.trailers is not None:
+            self._validate_trailer_response(status, headers, end_stream)
+
         if not has_message_body(status):
             # Header-only response status
             self.response_func = None
@@ -379,6 +382,30 @@ class Http(Stream, metaclass=TouchUpMeta):
             self.response_func = None
             self.stage = Stage.IDLE
 
+    def _validate_trailer_response(
+        self, status: int, headers: Header, end_stream: bool
+    ) -> None:
+        """Backstop checks run before a single response byte is sent.
+
+        Declaration-time checks live on the response object, but the
+        final framing decision (chunked vs. Content-Length vs. bodyless)
+        is only known here. Reject deterministically instead of silently
+        dropping the trailer section.
+        """
+        if not self.protocol.app.config.TRAILERS_ENABLED:
+            raise ServerError("Response trailers have been disabled.")
+        if not has_message_body(status):
+            raise ServerError(
+                f"Trailers are not allowed on a {status} response "
+                "without a message body."
+            )
+        if self.head_only:
+            raise ServerError("Trailers cannot be sent for a HEAD response.")
+        if end_stream or "content-length" in headers:
+            raise ServerError(
+                "Trailers can only be used with chunked transfer encoding."
+            )
+
     async def http1_response_chunked(
         self, data: bytes, end_stream: bool
     ) -> None:
@@ -386,11 +413,30 @@ class Http(Stream, metaclass=TouchUpMeta):
         # Chunked encoding
         size = len(data)
         if end_stream:
-            await self._send(
-                b"%x\r\n%b\r\n0\r\n\r\n" % (size, data)
-                if size
-                else b"0\r\n\r\n"
-            )
+            try:
+                # Build the whole terminator before writing so a failure
+                # never leaves a half-written trailer section on the wire.
+                trailer_section = self.response.get_trailer_section()
+                if trailer_section:
+                    if size:
+                        await self._send(
+                            b"%x\r\n%b\r\n0\r\n%b\r\n"
+                            % (size, data, trailer_section)
+                        )
+                    else:
+                        await self._send(b"0\r\n%b\r\n" % trailer_section)
+                else:
+                    await self._send(
+                        b"%x\r\n%b\r\n0\r\n\r\n" % (size, data)
+                        if size
+                        else b"0\r\n\r\n"
+                    )
+            except Exception:
+                # The trailer section could not be completed. The message
+                # framing is now unreliable, so the connection must not be
+                # reused for another request.
+                self.keep_alive = False
+                raise
             self.response_func = None
             self.stage = Stage.IDLE
         elif size:

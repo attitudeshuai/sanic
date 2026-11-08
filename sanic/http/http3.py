@@ -227,6 +227,10 @@ class HTTPReceiver(Receiver, Stream):
         self._send(data, end_stream)
 
     def _send(self, data: bytes, end_stream: bool) -> None:
+        if self.response is not None and self.response.trailers is not None:
+            raise ServerError(
+                "Trailers are only supported for chunked HTTP/1.1 responses."
+            )
         if not self.headers_sent:
             self.send_headers()
         if self.stage is not Stage.RESPONSE:

@@ -228,6 +228,11 @@ class ASGIApp:
                 )
             return
         if self.response and self.stage is Stage.HANDLER:
+            if getattr(self.response, "trailers", None) is not None:
+                raise ServerError(
+                    "Trailers are only supported for chunked HTTP/1.1 "
+                    "responses."
+                )
             await self.transport.send(
                 {
                     "type": "http.response.start",

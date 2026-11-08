@@ -66,6 +66,7 @@ DEFAULT_CONFIG = {
     "RESPONSE_TIMEOUT": 60,
     "TLS_CERT_PASSWORD": "",  # nosec B105
     "TOUCHUP": _default,
+    "TRAILERS_ENABLED": True,
     "USE_UVLOOP": _default,
     "WEBSOCKET_MAX_SIZE": 2**20,  # 1 MiB
     "WEBSOCKET_PING_INTERVAL": 20,
@@ -172,6 +173,7 @@ class Config(dict, metaclass=DescriptorMeta):
     SERVER_NAME: str
     TLS_CERT_PASSWORD: str
     TOUCHUP: Default | bool
+    TRAILERS_ENABLED: bool
     USE_UVLOOP: Default | bool
     WEBSOCKET_MAX_SIZE: int
     WEBSOCKET_PING_INTERVAL: int
